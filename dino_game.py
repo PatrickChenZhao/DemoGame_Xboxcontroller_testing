@@ -71,14 +71,26 @@ def load_image(filename, size):
     """
     加载图片并缩放到指定尺寸。
 
-    convert_alpha() 会保留 PNG 的透明通道，使角色和障碍物边缘更自然。
+    素材使用纯白色背景，因此这里使用 convert() 后设置 colorkey，
+    让 (255, 255, 255) 白底在绘制和 mask 生成时都被视为透明区域。
     如果素材缺失，直接抛出清晰错误，方便定位问题。
     """
     path = asset_path(filename)
     if not os.path.exists(path):
         raise FileNotFoundError(f"找不到素材文件：{path}")
-    image = pygame.image.load(path).convert_alpha()
-    return pygame.transform.smoothscale(image, size)
+    image = pygame.image.load(path).convert()
+    image.set_colorkey((255, 255, 255))
+    # 使用普通 scale 避免 smoothscale 把纯白背景混合成近白色像素，
+    # 否则 colorkey 无法完全扣掉这些新产生的边缘像素。
+    scaled_image = pygame.transform.scale(image, size)
+    scaled_image.set_colorkey((255, 255, 255))
+    return scaled_image
+
+
+def masks_overlap(first_rect, first_mask, second_rect, second_mask):
+    """使用像素级 mask 判断两个对象是否发生真实可见区域重叠。"""
+    offset = (second_rect.x - first_rect.x, second_rect.y - first_rect.y)
+    return first_mask.overlap(second_mask, offset) is not None
 
 
 class Player:
@@ -91,9 +103,12 @@ class Player:
 
     def __init__(self, normal_image):
         self.normal_image = normal_image
-        self.duck_image = pygame.transform.smoothscale(
+        self.duck_image = pygame.transform.scale(
             normal_image, (self.DUCK_WIDTH, self.DUCK_HEIGHT)
         )
+        self.duck_image.set_colorkey((255, 255, 255))
+        self.image = self.normal_image
+        self.mask = pygame.mask.from_surface(self.image)
         self.rect = pygame.Rect(
             PLAYER_X,
             HORIZON_Y - self.NORMAL_HEIGHT,
@@ -139,6 +154,8 @@ class Player:
         self.rect.size = (self.NORMAL_WIDTH, self.NORMAL_HEIGHT)
         self.rect.x = PLAYER_X
         self.rect.bottom = bottom
+        self.image = self.normal_image
+        self.mask = pygame.mask.from_surface(self.image)
 
     def _apply_duck_size(self):
         """切换到下蹲碰撞盒，高度约为站立时的一半。"""
@@ -146,6 +163,8 @@ class Player:
         self.rect.size = (self.DUCK_WIDTH, self.DUCK_HEIGHT)
         self.rect.x = PLAYER_X
         self.rect.bottom = bottom
+        self.image = self.duck_image
+        self.mask = pygame.mask.from_surface(self.image)
 
     def update(self):
         """应用重力并处理落地。"""
@@ -164,8 +183,7 @@ class Player:
 
     def draw(self, screen):
         """根据状态绘制站立或下蹲图片。"""
-        image = self.duck_image if self.ducking else self.normal_image
-        screen.blit(image, self.rect)
+        screen.blit(self.image, self.rect)
 
 
 class Bullet:
@@ -175,13 +193,16 @@ class Bullet:
     HEIGHT = 6
 
     def __init__(self, x, y):
+        self.image = pygame.Surface((self.WIDTH, self.HEIGHT)).convert()
+        self.image.fill(BLUE)
+        self.mask = pygame.mask.from_surface(self.image)
         self.rect = pygame.Rect(x, y, self.WIDTH, self.HEIGHT)
 
     def update(self):
         self.rect.x += BULLET_SPEED
 
     def draw(self, screen):
-        pygame.draw.rect(screen, BLUE, self.rect)
+        screen.blit(self.image, self.rect)
 
     @property
     def off_screen(self):
@@ -194,6 +215,7 @@ class Obstacle:
     def __init__(self, kind, image, speed):
         self.kind = kind
         self.image = image
+        self.mask = pygame.mask.from_surface(self.image)
         self.speed = speed
         self.rect = image.get_rect()
 
@@ -252,6 +274,12 @@ class Game:
         # 这里保存第一个检测到的手柄；若没插手柄，游戏仍显示提示并允许键盘测试。
         self.joystick = None
         self._init_joystick()
+
+        # 关键修复：
+        # ViGEmBus / vgamepad 场景下，虚拟手柄可能反复触发设备添加/移除事件。
+        # 游戏运行中绝对不要响应这些事件重新初始化 joystick，否则会造成硬件轮询风暴。
+        # 因此在主循环开始前屏蔽热插拔事件，只保留普通按键事件和每帧按钮状态读取。
+        pygame.event.set_blocked([pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED])
         self.reset()
 
     def _init_joystick(self):
@@ -308,12 +336,6 @@ class Game:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-
-            # 手柄在运行时插拔时，重新初始化当前手柄状态。
-            if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
-                pygame.joystick.quit()
-                pygame.joystick.init()
-                self._init_joystick()
 
             if self.game_over:
                 # Game Over 后，按手柄任意键或键盘任意键都重置游戏。
@@ -406,7 +428,7 @@ class Game:
 
         for bullet_index, bullet in enumerate(self.bullets):
             for obstacle_index, obstacle in enumerate(self.obstacles):
-                if not bullet.rect.colliderect(obstacle.rect):
+                if not masks_overlap(bullet.rect, bullet.mask, obstacle.rect, obstacle.mask):
                     continue
 
                 bullets_to_remove.add(bullet_index)
@@ -431,7 +453,7 @@ class Game:
     def _handle_player_collisions(self):
         """玩家碰到任意障碍物即 Game Over。"""
         for obstacle in self.obstacles:
-            if self.player.rect.colliderect(obstacle.rect):
+            if masks_overlap(self.player.rect, self.player.mask, obstacle.rect, obstacle.mask):
                 self.game_over = True
                 break
 
