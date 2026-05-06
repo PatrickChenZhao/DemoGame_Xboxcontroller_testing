@@ -36,6 +36,8 @@ HORIZON_Y = 330
 
 # 玩家在屏幕左侧的固定 x 坐标。
 PLAYER_X = 90
+PLAYER_NORMAL_WIDTH = 58
+PLAYER_NORMAL_HEIGHT = 82
 
 # 物理参数。数值按 60 FPS 调整，手感偏街机，响应清晰。
 GRAVITY = 0.85
@@ -48,6 +50,7 @@ OBSTACLE_SPAWN_MIN_MS = 900
 OBSTACLE_SPAWN_MAX_MS = 1600
 BULLET_SPEED = 12
 SHOOT_COOLDOWN_MS = 280
+BULLET_CENTER_Y = HORIZON_Y - PLAYER_NORMAL_HEIGHT // 2
 
 # Xbox 常见按键编号。不同驱动可能略有差异，但题目指定按此映射实现。
 BUTTON_A = 0
@@ -67,26 +70,6 @@ def asset_path(filename):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-def load_image(filename, size):
-    """
-    加载图片并缩放到指定尺寸。
-
-    素材使用纯白色背景，因此这里使用 convert() 后设置 colorkey，
-    让 (255, 255, 255) 白底在绘制和 mask 生成时都被视为透明区域。
-    如果素材缺失，直接抛出清晰错误，方便定位问题。
-    """
-    path = asset_path(filename)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"找不到素材文件：{path}")
-    image = pygame.image.load(path).convert()
-    image.set_colorkey((255, 255, 255))
-    # 使用普通 scale 避免 smoothscale 把纯白背景混合成近白色像素，
-    # 否则 colorkey 无法完全扣掉这些新产生的边缘像素。
-    scaled_image = pygame.transform.scale(image, size)
-    scaled_image.set_colorkey((255, 255, 255))
-    return scaled_image
-
-
 def masks_overlap(first_rect, first_mask, second_rect, second_mask):
     """使用像素级 mask 判断两个对象是否发生真实可见区域重叠。"""
     offset = (second_rect.x - first_rect.x, second_rect.y - first_rect.y)
@@ -96,18 +79,21 @@ def masks_overlap(first_rect, first_mask, second_rect, second_mask):
 class Player:
     """玩家：负责站立、跳跃、下蹲、重力和绘制。"""
 
-    NORMAL_WIDTH = 58
-    NORMAL_HEIGHT = 82
+    NORMAL_WIDTH = PLAYER_NORMAL_WIDTH
+    NORMAL_HEIGHT = PLAYER_NORMAL_HEIGHT
     DUCK_WIDTH = 74
     DUCK_HEIGHT = 42
 
-    def __init__(self, normal_image):
-        self.normal_image = normal_image
-        self.duck_image = pygame.transform.scale(
-            normal_image, (self.DUCK_WIDTH, self.DUCK_HEIGHT)
+    def __init__(self, filename="robotman.png"):
+        # 玩家素材带 Alpha 通道，必须用 convert_alpha() 保留透明区域。
+        self.image = pygame.image.load(asset_path(filename)).convert_alpha()
+        self.image = pygame.transform.scale(
+            self.image, (self.NORMAL_WIDTH, self.NORMAL_HEIGHT)
         )
-        self.duck_image.set_colorkey((255, 255, 255))
-        self.image = self.normal_image
+        self.normal_image = self.image
+        self.duck_image = pygame.transform.scale(
+            self.normal_image, (self.DUCK_WIDTH, self.DUCK_HEIGHT)
+        )
         self.mask = pygame.mask.from_surface(self.image)
         self.rect = pygame.Rect(
             PLAYER_X,
@@ -193,7 +179,7 @@ class Bullet:
     HEIGHT = 6
 
     def __init__(self, x, y):
-        self.image = pygame.Surface((self.WIDTH, self.HEIGHT)).convert()
+        self.image = pygame.Surface((self.WIDTH, self.HEIGHT), pygame.SRCALPHA).convert_alpha()
         self.image.fill(BLUE)
         self.mask = pygame.mask.from_surface(self.image)
         self.rect = pygame.Rect(x, y, self.WIDTH, self.HEIGHT)
@@ -210,23 +196,22 @@ class Bullet:
 
 
 class Obstacle:
-    """障碍物：仙人掌、飞鸟、战斗机共用的移动和绘制逻辑。"""
+    """障碍物基类：负责共用的移动和绘制逻辑。"""
 
-    def __init__(self, kind, image, speed):
+    def __init__(self, kind, speed):
         self.kind = kind
-        self.image = image
-        self.mask = pygame.mask.from_surface(self.image)
         self.speed = speed
-        self.rect = image.get_rect()
 
-        # 三类障碍的垂直位置：
-        # - cactus：地面，必须跳过
-        # - bird / jet：半空，高度一致，必须下蹲，飞鸟也可被子弹击毁
+    def setup_collision(self):
+        """根据当前 image 生成 rect 和像素遮罩。"""
+        self.mask = pygame.mask.from_surface(self.image)
+        self.rect = self.image.get_rect()
         self.rect.left = SCREEN_WIDTH + random.randint(20, 80)
-        if kind == "cactus":
-            self.rect.bottom = HORIZON_Y
-        else:
-            self.rect.bottom = HORIZON_Y - 50
+        self.place_vertically()
+
+    def place_vertically(self):
+        """由具体障碍物子类决定自己的 Y 轴位置。"""
+        raise NotImplementedError
 
     def update(self):
         self.rect.x -= int(self.speed)
@@ -237,6 +222,47 @@ class Obstacle:
     @property
     def off_screen(self):
         return self.rect.right < 0
+
+
+class Cactus(Obstacle):
+    """地面仙人掌：只能跳过，子弹会直接穿透。"""
+
+    def __init__(self, speed):
+        super().__init__("cactus", speed)
+        self.image = pygame.image.load(asset_path("cactus.png")).convert_alpha()
+        self.image = pygame.transform.scale(self.image, (46, 72))
+        self.setup_collision()
+
+    def place_vertically(self):
+        self.rect.bottom = HORIZON_Y
+
+
+class Bird(Obstacle):
+    """半空飞鸟：可下蹲躲避，也可被子弹击毁。"""
+
+    def __init__(self, speed):
+        super().__init__("bird", speed)
+        self.image = pygame.image.load(asset_path("bird.png")).convert_alpha()
+        self.image = pygame.transform.scale(self.image, (64, 42))
+        self.setup_collision()
+
+    def place_vertically(self):
+        # 修复射击高度 BUG：飞鸟中心线与玩家站立射击时的子弹中心线完全一致。
+        self.rect.centery = BULLET_CENTER_Y
+
+
+class FighterJet(Obstacle):
+    """半空战斗机：不可摧毁，子弹命中后只有子弹消失。"""
+
+    def __init__(self, speed):
+        super().__init__("jet", speed)
+        self.image = pygame.image.load(asset_path("jetflight.png")).convert_alpha()
+        self.image = pygame.transform.scale(self.image, (78, 38))
+        self.setup_collision()
+
+    def place_vertically(self):
+        # 战斗机仍保持半空下蹲躲避高度。
+        self.rect.bottom = HORIZON_Y - 50
 
 
 class Game:
@@ -252,15 +278,7 @@ class Game:
         self.font = pygame.font.SysFont("arial", 24)
         self.big_font = pygame.font.SysFont("arial", 46, bold=True)
 
-        # 加载并统一缩放素材。真实碰撞盒与绘制尺寸一致，逻辑直观。
-        self.images = {
-            "player": load_image("robotman.png", (Player.NORMAL_WIDTH, Player.NORMAL_HEIGHT)),
-            "cactus": load_image("cactus.png", (46, 72)),
-            "bird": load_image("bird.png", (64, 42)),
-            "jet": load_image("jetflight.png", (78, 38)),
-        }
-
-        self.player = Player(self.images["player"])
+        self.player = Player()
         self.bullets = []
         self.obstacles = []
         self.game_over = False
@@ -316,7 +334,7 @@ class Game:
             return
 
         bullet_x = self.player.rect.right + 4
-        bullet_y = self.player.rect.centery - Bullet.HEIGHT // 2
+        bullet_y = BULLET_CENTER_Y - Bullet.HEIGHT // 2
         self.bullets.append(Bullet(bullet_x, bullet_y))
         self.last_shot_ticks = now
 
@@ -327,7 +345,12 @@ class Game:
             weights=[0.48, 0.32, 0.20],
             k=1,
         )[0]
-        self.obstacles.append(Obstacle(kind, self.images[kind], self.obstacle_speed))
+        obstacle_classes = {
+            "cactus": Cactus,
+            "bird": Bird,
+            "jet": FighterJet,
+        }
+        self.obstacles.append(obstacle_classes[kind](self.obstacle_speed))
         self._schedule_next_obstacle()
 
     def handle_events(self):
@@ -421,13 +444,16 @@ class Game:
         规则：
             - 子弹击中飞鸟：飞鸟被摧毁，子弹也消失。
             - 子弹击中战斗机：子弹消失，战斗机绝对不会被摧毁。
-            - 子弹击中仙人掌：本实现中子弹消失，仙人掌保留，仍需要跳过。
+            - 子弹遇到仙人掌：完全穿透，不做任何碰撞判定。
         """
         bullets_to_remove = set()
         obstacles_to_remove = set()
 
         for bullet_index, bullet in enumerate(self.bullets):
             for obstacle_index, obstacle in enumerate(self.obstacles):
+                if obstacle.kind == "cactus":
+                    continue
+
                 if not masks_overlap(bullet.rect, bullet.mask, obstacle.rect, obstacle.mask):
                     continue
 
@@ -436,7 +462,7 @@ class Game:
                 if obstacle.kind == "bird":
                     obstacles_to_remove.add(obstacle_index)
 
-                # 一颗子弹命中第一个障碍后立即停止，不继续穿透。
+                # 飞鸟和战斗机都会吞掉子弹；只有飞鸟会被同时移除。
                 break
 
         self.bullets = [
